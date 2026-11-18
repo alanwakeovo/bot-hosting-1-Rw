@@ -57,6 +57,32 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
+# 将 sing-box 的纯 socks 入站升级为 mixed (同时支持 Chrome 的 HTTP 代理和 SOCKS5)
+def ensure_mixed_proxy():
+    cfg_path = "sing-box-config.json"
+    if not os.path.exists(cfg_path):
+        return
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if re.search(r'"type"\s*:\s*"socks"', content):
+            print("🔧 将 sing-box 本地端口从纯 socks 升级为 mixed 混合模式 (兼容 Chrome HTTP 代理)...")
+            new_content = re.sub(r'"type"\s*:\s*"socks"', '"type": "mixed"', content)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            subprocess.run(["pkill", "-f", "sing-box"], stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            sb_bin = "./sing-box" if os.path.exists("./sing-box") else "sing-box"
+            subprocess.Popen(
+                [sb_bin, "run", "-c", cfg_path],
+                stdout=open("sing-box.log", "a"),
+                stderr=subprocess.STDOUT,
+            )
+            time.sleep(2)
+            print("✅ sing-box mixed 代理已重启就绪")
+    except Exception as e:
+        print(f"⚠️ 升级 sing-box mixed 模式出错: {e}")
+
 # ---------- 基础工具 ----------
 def js(sb, script, default=None, errors=None):
     try:
@@ -101,7 +127,6 @@ def safe_click(sb, selector, timeout=8):
             sb.js_click(selector)
             return True
         except Exception as e2:
-            # 终极 JS 原生点击兜底
             clicked = js(sb, f"""
                 var el = document.querySelector('{selector.replace("'", "\\'")}');
                 if (el) {{ el.click(); return true; }}
@@ -110,6 +135,59 @@ def safe_click(sb, selector, timeout=8):
             if clicked:
                 return True
             raise e2
+
+# 挂载 Fetch / XHR 拦截器，记录点击确认按钮后后端接口的真实返回状态与内容
+def install_network_sniffer(sb):
+    js(sb, """
+        try {
+            window.__renew_api_logs = [];
+            if (!window.__sniffer_installed) {
+                window.__sniffer_installed = true;
+                var origFetch = window.fetch;
+                window.fetch = async function() {
+                    var url = arguments[0] ? (typeof arguments[0] === 'string' ? arguments[0] : arguments[0].url) : '';
+                    try {
+                        var resp = await origFetch.apply(this, arguments);
+                        if (url && !url.includes('google') && !url.includes('cloudflare') && !url.includes('analytics')) {
+                            var clone = resp.clone();
+                            clone.text().then(function(body) {
+                                window.__renew_api_logs.push('FETCH ' + resp.status + ' ' + url.slice(0, 90) + ' -> ' + (body || '').slice(0, 200));
+                            }).catch(function(){});
+                        }
+                        return resp;
+                    } catch (err) {
+                        window.__renew_api_logs.push('FETCH_ERR ' + url.slice(0, 90) + ' -> ' + String(err));
+                        throw err;
+                    }
+                };
+                var origOpen = XMLHttpRequest.prototype.open;
+                var origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__url = url || '';
+                    this.__method = method || '';
+                    return origOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    var self = this;
+                    this.addEventListener('load', function() {
+                        if (self.__url && !self.__url.includes('google') && !self.__url.includes('cloudflare')) {
+                            window.__renew_api_logs.push('XHR ' + self.status + ' ' + self.__method + ' ' + self.__url.slice(0, 90) + ' -> ' + (self.responseText || '').slice(0, 200));
+                        }
+                    });
+                    return origSend.apply(this, arguments);
+                };
+            }
+        } catch(e) {}
+    """)
+
+def dump_network_sniffer(sb):
+    logs = js(sb, "return (window.__renew_api_logs || []).join('\\n');", "")
+    if logs:
+        print("📡 捕获到后端网络请求日志:")
+        for line in str(logs).splitlines()[-10:]:
+            print("   [API] " + line)
+    else:
+        print("📡 暂未捕获到新的后端业务请求")
 
 # Turnstile 定位失败时的现场诊断快照
 def diag_turnstile_dom(sb, errors=None):
@@ -138,7 +216,6 @@ def diag_turnstile_dom(sb, errors=None):
             print("   [diag][exec-error] " + str(err)[:200])
 
 # 页面注入脚本
-# Turnstile token（官方 JS 接口 或 表单隐藏域），未通过时为空串
 TURNSTILE_TOKEN_JS = """
 try {
     if (window.turnstile && window.turnstile.getResponse) {
@@ -147,7 +224,7 @@ try {
     }
 } catch (e) {}
 var els = document.querySelectorAll('input[name="cf-turnstile-response"]');
-for (var i = 0; i < els.length; i++) {
+for (var i = els.length - 1; i >= 0; i--) {
     if (els[i].value) return els[i].value;
 }
 return '';
@@ -163,7 +240,7 @@ TS_COORDS_JS = """
 function findWidget(root) {
     var els = root.querySelectorAll(
         'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"]');
-    for (var i = 0; i < els.length; i++) {
+    for (var i = els.length - 1; i >= 0; i--) {
         var r = els[i].getBoundingClientRect();
         if (r.width > 50 && r.height > 20) return els[i];
     }
@@ -178,7 +255,7 @@ function findWidget(root) {
 }
 function boxFromTokenInput() {
     var els = document.querySelectorAll('input[name="cf-turnstile-response"]');
-    for (var i = 0; i < els.length; i++) {
+    for (var i = els.length - 1; i >= 0; i--) {
         var cur = els[i].parentElement;
         for (var k = 0; k < 6 && cur; k++) {
             var r = cur.getBoundingClientRect();
@@ -194,7 +271,6 @@ var hr = hit.getBoundingClientRect();
 return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
 """
 
-# Turnstile 脚本异步渲染，轮询等待组件出现
 def wait_turnstile_present(sb, timeout=12):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -246,6 +322,22 @@ def _xdotool_click(x: int, y: int):
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+
+def click_screen_coords(sb, cx: int, cy: int):
+    try:
+        wi = js(sb, "return '' + (window.screenX || 0) + '|' + (window.screenY || 0) + '|' +"
+                    " window.outerHeight + '|' + window.innerHeight;", "")
+        parts = str(wi).split("|")
+        sx, sy = int(parts[0] or 0), int(parts[1] or 0)
+        bar = int(parts[2] or 800) - int(parts[3] or 768)
+        ax = int(cx) + sx
+        ay = int(cy) + sy + bar
+        print(f"🖱️ 底层物理坐标点击 ({ax}, {ay}) [视口: ({cx}, {cy})]")
+        _xdotool_click(ax, ay)
+        return True
+    except Exception as e:
+        print(f"⚠️ 底层物理坐标点击异常: {e}")
+        return False
 
 def turnstile_token(sb) -> str:
     token = js(sb, TURNSTILE_TOKEN_JS, "")
@@ -357,7 +449,6 @@ def normalize_date(date_str: str) -> str:
         return date_str
     date_str = date_str.strip()
 
-    # 处理 YYYY/MM/DD 或 MM/DD/YYYY
     if '/' in date_str:
         parts = date_str.split('/')
         if len(parts) == 3:
@@ -366,13 +457,11 @@ def normalize_date(date_str: str) -> str:
             if len(parts[0]) == 4:   # YYYY/MM/DD
                 return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
 
-    # 处理 YYYY-MM-DD
     if '-' in date_str:
         parts = date_str.split('-')
         if len(parts) == 3 and len(parts[0]) == 4:
             return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
 
-    # 处理英文日期格式，例如 "14 Nov 2026" 或 "14 November 2026"
     for fmt in ("%d %b %Y", "%d %B %Y"):
         try:
             dt = datetime.strptime(date_str, fmt)
@@ -387,9 +476,10 @@ DATE_RE = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # 优先匹配包含 "Expires" 的
+        r"[Ee]xpires\s*(?:on)?\s*[:\-]?\s*" + DATE_RE,
+        r"将于\s*" + DATE_RE + r"\s*到期",
         r"到期\s*[:\-]?\s*" + DATE_RE,
-        DATE_RE,                                # 兜底匹配
+        DATE_RE,
     ]
     
     for pattern in patterns:
@@ -399,7 +489,7 @@ def extract_expiry_date(page_source: str) -> str:
             
     return None
 
-# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+# 优先从 DOM 的 st-meta 元素提取到期日期
 def get_expiry_from_dom(sb) -> str:
     for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
         try:
@@ -411,137 +501,177 @@ def get_expiry_from_dom(sb) -> str:
             pass
     return None
 
+# 定位弹窗内的确认续期按钮 (例如 "Renew for 4 days")，排除外部的 "Renew free plan"
+FIND_MODAL_BTN_JS = """
+var btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+for (var i = btns.length - 1; i >= 0; i--) {
+    var b = btns[i];
+    var r = b.getBoundingClientRect();
+    if (r.width < 30 || r.height < 20) continue;
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true' || b.classList.contains('disabled')) continue;
+    var txt = (b.innerText || b.textContent || '').trim();
+    var low = txt.toLowerCase();
+    if (low === 'renew free plan' || low.includes('cancel') || low.includes('close') || low.includes('see plans')) continue;
+    if (low.includes('renew for') || low.includes('extend') || low.includes('confirm') || (low.includes('renew') && low.includes('day'))) {
+        b.setAttribute('data-modal-renew-btn', '1');
+        return {
+            found: true,
+            text: txt,
+            cx: Math.round(r.left + r.width / 2),
+            cy: Math.round(r.top + r.height / 2)
+        };
+    }
+}
+return {found: false};
+"""
+
 # 点击弹窗内的确认续期按钮
-def click_modal_renew_button(sb, timeout=15) -> bool:
+def click_modal_renew_button(sb, timeout=20) -> bool:
+    btn_diag = js(sb, """
+        var info = [];
+        var btns = document.querySelectorAll('button');
+        for (var j = 0; j < btns.length; j++) {
+            var b = btns[j];
+            var r = b.getBoundingClientRect();
+            if (r.width > 15 && r.height > 15) {
+                var txt = (b.innerText || b.textContent || '').trim();
+                info.push('[' + txt + '|disabled=' + b.disabled + '|cls=' + b.className + ']');
+            }
+        }
+        return info.join(', ');
+    """, "")
+    print(f"🔎 当前可见按钮列表: {btn_diag}")
+
     deadline = time.time() + timeout
-    modal_selectors = [
-        'div[role="dialog"] button.btn-primary:not([disabled])',
-        'div[role="dialog"] button[type="submit"]:not([disabled])',
-        '.modal button.btn-primary:not([disabled])',
-        'div[role="dialog"] button.btn-primary',
-        '.modal button.btn-primary',
-    ]
     while time.time() < deadline:
         dismiss_overlays(sb)
-        # 1. 尝试通过常规选择器点击
-        for sel in modal_selectors:
-            try:
-                if sb.is_element_visible(sel):
-                    safe_click(sb, sel, timeout=4)
-                    return True
-            except Exception:
-                pass
+        target = js(sb, FIND_MODAL_BTN_JS, {"found": False})
 
-        # 2. 通过 JS 在弹窗内精准查找包含 Renew / Extend / Confirm 的主按钮
-        clicked = js(sb, """
-            var dialogs = document.querySelectorAll('div[role="dialog"], .modal, [class*="modal"], [class*="dialog"]');
-            for (var i = 0; i < dialogs.length; i++) {
-                var btns = dialogs[i].querySelectorAll('button.btn-primary, button[type="submit"], button');
-                for (var j = 0; j < btns.length; j++) {
-                    var b = btns[j];
-                    var txt = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    if (!b.disabled && (txt.includes('renew') || txt.includes('extend') || txt.includes('confirm') || b.classList.contains('btn-primary'))) {
-                        b.click();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        """, False)
-        if clicked:
+        if target and target.get("found"):
+            btn_text = target.get("text", "")
+            cx, cy = int(target.get("cx", 0)), int(target.get("cy", 0))
+            print(f"🖱️ 定位到弹窗确认按钮 '{btn_text}' ({cx}, {cy})，执行点击...")
+
+            try:
+                sb.click('[data-modal-renew-btn="1"]', timeout=4)
+            except Exception as e:
+                print(f"⚠️ 常规点击确认按钮异常，改用底层物理坐标点击: {str(e)[:80]}")
+                click_screen_coords(sb, cx, cy)
+
+            time.sleep(4)
+            api_count = js(sb, "return (window.__renew_api_logs || []).length;", 0)
+            if api_count == 0:
+                t2 = js(sb, FIND_MODAL_BTN_JS, {"found": False})
+                if t2 and t2.get("found"):
+                    print("🖱️ 未检测到后端请求且按钮仍在，补充底层物理坐标点击...")
+                    click_screen_coords(sb, int(t2.get("cx", cx)), int(t2.get("cy", cy)))
+                    time.sleep(4)
+
+            modal_txt = js(sb, """
+                var d = document.querySelector('div[role="dialog"], .modal, [class*="modal"]');
+                return d ? (d.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
+            """, "")
+            if modal_txt:
+                print(f"📋 点击后弹窗内容状态: {modal_txt}")
             return True
 
         time.sleep(1)
+
     return False
 
-# 主流程
-def main():
-    print("#" * 25)
-    print("   Bot-hosting 自动续期")
-    print("#" * 25)
+# 执行单次浏览器会话
+def run_session(use_proxy: bool, raw_proxy: str, headless: bool) -> bool:
+    sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en-US"}
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
-
-    sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {PROXY_SERVER}")
-        sb_kwargs["proxy"] = PROXY_SERVER
+    if use_proxy and raw_proxy:
+        ensure_mixed_proxy()
+        clean_proxy = re.sub(r"^[a-zA-Z0-9]+://", "", raw_proxy).strip()
+        print(f"🔗 挂载代理: {clean_proxy}")
+        sb_kwargs["proxy"] = clean_proxy
+        try:
+            ip = get_current_ip(f"http://{clean_proxy}")
+            print(f"📍 当前代理出口IP: {ip}")
+        except Exception as e:
+            print(f"⚠️ HTTP 代理连通性测试失败 ({e})，放弃代理模式")
+            return False
     else:
         print("🍭 未使用代理，直连访问")
-
-    with SB(**sb_kwargs) as sb:
         try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            ip = get_current_ip("")
             print(f"📍 当前出口IP: {ip}")
         except Exception as e:
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
+    with SB(**sb_kwargs) as sb:
         login_ok = False
+        print("🚀 启动浏览器...")
+        try:
+            print(f"🌐 访问 {BASE_URL}/login")
+            sb.open(f"{BASE_URL}/login")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
+            dismiss_overlays(sb)
 
-        # 账号密码登录
-        if EMAIL and PASSWORD:
-            print("🚀 启动浏览器...")
-            try:
-                print(f"🌐 访问 {BASE_URL}/login")
-                sb.open(f"{BASE_URL}/login")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
+            # 如果遇到前置全屏 Cloudflare 盾，先过盾
+            if not sb.is_element_present('button[type="submit"]') and wait_turnstile_present(sb, timeout=5):
+                print("🛡️ 登录页检测到前置 Cloudflare 验证，先处理验证...")
+                handle_turnstile(sb)
+                sb.sleep(5)
                 dismiss_overlays(sb)
 
-                safe_click(sb, 'button[type="submit"]') # 点击 Continue with email 按钮
-                sb.sleep(10)  # 等待页面加载
-                dismiss_overlays(sb)
+            safe_click(sb, 'button[type="submit"]') # 点击 Continue with email 按钮
+            sb.sleep(10)  # 等待密码框加载
+            dismiss_overlays(sb)
 
-                print("📧 填写邮箱...")
-                sb.input('input[type="email"]', EMAIL)
-                sb.sleep(1)
-                print("🔑 填写密码...")
-                sb.input('input[type="password"]', PASSWORD)
-                sb.sleep(3)
+            print("📧 填写邮箱...")
+            sb.input('input[type="email"]', EMAIL)
+            sb.sleep(1)
+            print("🔑 填写密码...")
+            sb.input('input[type="password"]', PASSWORD)
+            sb.sleep(3)
 
-                if wait_turnstile_present(sb):
-                    if not handle_turnstile(sb):
-                        print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
-                        try:
-                            sb.cdp.click_captcha()
-                            sb.sleep(4)
-                        except Exception as e:
-                            print(f"⚠️ 兜底点击失败: {e}")
-                else:
-                    print("ℹ️ 未检测到 Turnstile")
-                sb.sleep(1)
-                safe_click(sb, 'button[type="submit"]') # 点击登录按钮
-                print("🖱️ 提交登录按钮")
-                sb.sleep(6)  # 等待页面加载
-                sb.wait_for_ready_state_complete()
-                
-                sb.open(f"{BASE_URL}/dash/billings")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(4)
-                dismiss_overlays(sb)
+            if wait_turnstile_present(sb):
+                if not handle_turnstile(sb):
+                    print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
+                    try:
+                        sb.cdp.click_captcha()
+                        sb.sleep(4)
+                    except Exception as e:
+                        print(f"⚠️ 兜底点击失败: {e}")
+            else:
+                print("ℹ️ 未检测到 Turnstile")
 
-                current_url = sb.get_current_url()
-                current_title = sb.get_title()
-                print(f"📝 当前URL: {current_url}, Title: {current_title}")
+            sb.sleep(1)
+            safe_click(sb, 'button[type="submit"]') # 点击登录按钮
+            print("🖱️ 提交登录按钮")
+            sb.sleep(6)
+            sb.wait_for_ready_state_complete()
+            
+            sb.open(f"{BASE_URL}/dash/billings")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(4)
+            dismiss_overlays(sb)
 
-                if "/dash/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                    login_ok = True
-                    print("✅ Password 登录成功,当前已到达账单页")
-                else:
-                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
-            except Exception as e:
-                print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
+            current_url = sb.get_current_url()
+            current_title = sb.get_title()
+            print(f"📝 当前URL: {current_url}, Title: {current_title}")
+
+            if "/dash/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+                login_ok = True
+                print("✅ Password 登录成功,当前已到达账单页")
+            else:
+                print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+        except Exception as e:
+            print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
 
         if not login_ok:
-            send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
-            return
+            return False
 
         # 清理 GDPR 隐私遮罩弹窗并提取当前到期日期
         sb.sleep(2)
         dismiss_overlays(sb)
+        install_network_sniffer(sb)
+
         try:
             page_source = sb.get_page_text() + "\n" + sb.get_page_source()
         except Exception:
@@ -577,7 +707,6 @@ def main():
             except Exception:
                 pass
 
-        # 如果页面文本中有冷却倒计时但按钮被禁用不可点，也做一次全局正则兜底
         if not outer_renew_selector and not countdown_text:
             m_cd = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", page_source, re.I)
             if m_cd:
@@ -589,19 +718,17 @@ def main():
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(1)
-                # 清空旧的 Turnstile token 防止误判登录页残留状态
                 js(sb, """
                     var els = document.querySelectorAll('input[name="cf-turnstile-response"]');
                     els.forEach(function(e){ e.value = ''; });
                 """)
                 safe_click(sb, outer_renew_selector)
-                sb.sleep(8)  # 等待模态框和 Turnstile 组件渲染
+                sb.sleep(8)
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
-                return
+                return True
 
-            # 处理弹窗中的 Turnstile
             turnstile_passed = True
             if wait_turnstile_present(sb, timeout=15):
                 turnstile_passed = handle_turnstile(sb)
@@ -619,20 +746,21 @@ def main():
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
+                return True
 
-            # 点击弹窗内确认续期按钮
             print("⏳ 等待弹窗内续期确认按钮可用并点击...")
             sb.sleep(2)
-            if click_modal_renew_button(sb, timeout=15):
+            if click_modal_renew_button(sb, timeout=20):
                 print("✅ 已点击弹窗内续期确认按钮")
             else:
-                print("⚠️ 未能定位或点击弹窗内确认按钮，可能点击外部按钮时已直接触发续期")
+                print("⚠️ 未能定位或点击弹窗内确认按钮")
+
+            dump_network_sniffer(sb)
 
             print("⏳ 等待后端处理并刷新页面获取最新到期时间...")
             sb.sleep(6)
+            dump_network_sniffer(sb)
 
-            # 主动刷新账单页，确保拿到最新 DOM 数据
             try:
                 sb.open(f"{BASE_URL}/dash/billings")
                 sb.wait_for_ready_state_complete()
@@ -641,7 +769,6 @@ def main():
             except Exception as e:
                 print(f"⚠️ 刷新账单页面出错: {e}")
 
-            # 提取新的到期日期和倒计时
             try:
                 new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
             except Exception:
@@ -679,7 +806,6 @@ def main():
                         expiry_date=new_expiry or current_expiry or "（未获取到）"
                     )
                 )
-
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
@@ -702,6 +828,27 @@ def main():
                 )
 
         print("🏁 脚本执行完毕")
+        return True
+
+def main():
+    print("#" * 25)
+    print("   Bot-hosting 自动续期")
+    print("#" * 25)
+
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
+
+    if IS_PROXY:
+        ok = run_session(use_proxy=True, raw_proxy=PROXY_SERVER, headless=HEADLESS)
+        if not ok:
+            print("🔄 代理模式下登录未成功，自动回退直连模式重试...")
+            ok = run_session(use_proxy=False, raw_proxy="", headless=HEADLESS)
+    else:
+        ok = run_session(use_proxy=False, raw_proxy="", headless=HEADLESS)
+
+    if not ok:
+        send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
 
 if __name__ == "__main__":
     main()
